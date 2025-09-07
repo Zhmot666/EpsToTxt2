@@ -185,10 +185,12 @@ def build_executable():
         '--icon=icon.ico',             # Иконка
         '--version-file=version_info.txt',  # Информация о версии
         '--add-data=README.md;.',      # Добавляем README
-        '--add-data=OPTIMIZATIONS.md;.',  # Добавляем документацию
+        '--add-data=RELIABILITY_ANALYSIS.md;.',  # Добавляем анализ надежности
         '--hidden-import=pylibdmtx.pylibdmtx',
+        '--hidden-import=pylibdmtx',
         '--hidden-import=numpy',
         '--hidden-import=PIL',
+        '--collect-all=pylibdmtx',     # Собираем все файлы pylibdmtx
         'gui_main.py'
     ]
     
@@ -211,8 +213,8 @@ def build_executable():
             # Копируем документацию
             if os.path.exists('README.md'):
                 shutil.copy2('README.md', dist_path / 'README.md')
-            if os.path.exists('OPTIMIZATIONS.md'):
-                shutil.copy2('OPTIMIZATIONS.md', dist_path / 'OPTIMIZATIONS.md')
+            if os.path.exists('RELIABILITY_ANALYSIS.md'):
+                shutil.copy2('RELIABILITY_ANALYSIS.md', dist_path / 'RELIABILITY_ANALYSIS.md')
             
             print("📁 Созданы папки In и Out")
             print("📋 Скопирована документация")

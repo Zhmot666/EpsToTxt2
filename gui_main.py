@@ -110,8 +110,10 @@ class ModernProgressBar(QProgressBar):
 class ProcessingThread(QThread):
     """Поток для обработки файлов без блокировки GUI"""
     
-    progress_updated = pyqtSignal(int)
+    progress_updated = pyqtSignal(int)  # Прогресс архивов
+    file_progress_updated = pyqtSignal(int, int, int)  # Прогресс файлов (current, total, archive_index)
     file_processed = pyqtSignal(str, bool, str)
+    archive_started = pyqtSignal(str, int)  # Название архива и количество файлов
     archive_completed = pyqtSignal(str, dict)
     processing_finished = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
@@ -142,8 +144,23 @@ class ProcessingThread(QThread):
                     
                 zip_path = os.path.join(self.input_dir, zip_file)
                 
-                # Обрабатываем архив
-                stats = process_zip_archive(zip_path, self.output_dir, self.max_workers)
+                # Сначала получаем информацию об архиве для прогресса файлов
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        eps_files = [f for f in zf.namelist() if f.lower().endswith('.eps')]
+                        file_count = len(eps_files)
+                        self.archive_started.emit(zip_file, file_count)
+                        
+                        # Сбрасываем прогресс файлов для нового архива
+                        self.file_progress_updated.emit(0, file_count, i)
+                        
+                except Exception:
+                    file_count = 0
+                    self.archive_started.emit(zip_file, 0)
+                
+                # Обрабатываем архив с отслеживанием прогресса файлов
+                stats = self.process_zip_with_progress(zip_path, self.output_dir, i, file_count)
                 
                 # Обновляем статистику
                 total_stats['archives_processed'] += 1
@@ -152,7 +169,7 @@ class ProcessingThread(QThread):
                 total_stats['total_failed'] += stats['failed']
                 total_stats['total_time'] += stats['processing_time']
                 
-                # Сигналы о прогрессе
+                # Сигналы о прогрессе архивов
                 progress = int((i + 1) / len(self.zip_files) * 100)
                 self.progress_updated.emit(progress)
                 self.archive_completed.emit(zip_file, stats)
@@ -171,6 +188,89 @@ class ProcessingThread(QThread):
             
         except Exception as e:
             self.error_occurred.emit(str(e))
+    
+    def process_zip_with_progress(self, zip_path, output_dir, archive_index, total_files):
+        """Обработка архива с отслеживанием прогресса файлов"""
+        # Используем модифицированную версию process_zip_archive
+        import zipfile
+        import os
+        
+        archive_name = os.path.splitext(os.path.basename(zip_path))[0]
+        results = []
+        stats = {
+            'total_files': 0,
+            'successful': 0,
+            'failed': 0,
+            'start_time': time.time()
+        }
+        
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_file:
+                eps_files = [f for f in zip_file.namelist() if f.lower().endswith('.eps')]
+                stats['total_files'] = len(eps_files)
+                
+                if not eps_files:
+                    return stats
+                
+                # Определяем количество потоков
+                max_workers = self.max_workers
+                if max_workers is None:
+                    max_workers = min(len(eps_files), os.cpu_count() or 1)
+                
+                # Подготавливаем аргументы для многопоточной обработки
+                file_args = [(zip_path, eps_file) for eps_file in eps_files]
+                
+                # Обрабатываем файлы параллельно с отслеживанием прогресса
+                from concurrent.futures import ThreadPoolExecutor
+                from main import _process_single_eps_file
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Отправляем все задачи
+                    future_to_file = {executor.submit(_process_single_eps_file, args): i 
+                                    for i, args in enumerate(file_args)}
+                    
+                    completed = 0
+                    for future in future_to_file:
+                        if self.is_cancelled:
+                            break
+                            
+                        try:
+                            eps_file, code, success, error_msg = future.result()
+                            
+                            if success:
+                                results.append(f"{eps_file}: {code}")
+                                stats['successful'] += 1
+                            else:
+                                results.append(f"{eps_file}: {error_msg}")
+                                stats['failed'] += 1
+                            
+                            # Обновляем прогресс файлов
+                            completed += 1
+                            self.file_progress_updated.emit(completed, len(eps_files), archive_index)
+                            
+                        except Exception as e:
+                            stats['failed'] += 1
+                            completed += 1
+                            self.file_progress_updated.emit(completed, len(eps_files), archive_index)
+        
+        except Exception as e:
+            stats['failed'] += 1
+        
+        stats['end_time'] = time.time()
+        stats['processing_time'] = stats['end_time'] - stats['start_time']
+        
+        # Сохраняем результаты
+        output_file = os.path.join(output_dir, f"{archive_name}_results.txt")
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for result in results:
+                    if ": " in result and not result.startswith("Ошибка"):
+                        code = result.split(": ", 1)[1]
+                        f.write(code + "\n")
+        except Exception:
+            pass
+        
+        return stats
     
     def cancel(self):
         """Отменить обработку"""
@@ -394,22 +494,51 @@ class EpsToTxtMainWindow(QMainWindow):
     def create_status_panel(self, layout):
         """Создание панели статуса и прогресса"""
         status_frame = QFrame()
-        status_frame.setMaximumHeight(100)
+        status_frame.setMaximumHeight(140)
         status_layout = QVBoxLayout(status_frame)
         
-        # Прогресс-бар
-        progress_layout = QHBoxLayout()
-        progress_layout.addWidget(QLabel("Прогресс:"))
+        # Прогресс архивов
+        archives_layout = QHBoxLayout()
+        archives_layout.addWidget(QLabel("📦 Архивы:"))
         
         self.progress_bar = ModernProgressBar()
         self.progress_bar.setValue(0)
-        progress_layout.addWidget(self.progress_bar)
+        archives_layout.addWidget(self.progress_bar)
         
-        self.progress_label = QLabel("0%")
-        self.progress_label.setMinimumWidth(40)
-        progress_layout.addWidget(self.progress_label)
+        self.progress_label = QLabel("0 из 0")
+        self.progress_label.setMinimumWidth(80)
+        self.progress_label.setStyleSheet("font-weight: bold; color: #4A90E2;")
+        archives_layout.addWidget(self.progress_label)
         
-        status_layout.addLayout(progress_layout)
+        status_layout.addLayout(archives_layout)
+        
+        # Прогресс файлов в текущем архиве
+        files_layout = QHBoxLayout()
+        files_layout.addWidget(QLabel("📄 Файлы:"))
+        
+        self.file_progress_bar = ModernProgressBar()
+        self.file_progress_bar.setValue(0)
+        # Устанавливаем другой цвет для прогресса файлов
+        self.file_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background-color: #E9ECEF;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #7B68EE, stop:1 #9370DB);
+                border-radius: 4px;
+            }
+        """)
+        files_layout.addWidget(self.file_progress_bar)
+        
+        self.file_progress_label = QLabel("0 из 0")
+        self.file_progress_label.setMinimumWidth(80)
+        self.file_progress_label.setStyleSheet("font-weight: bold; color: #7B68EE;")
+        files_layout.addWidget(self.file_progress_label)
+        
+        status_layout.addLayout(files_layout)
         
         # Текущий статус
         self.status_label = QLabel("Готов к обработке")
@@ -566,7 +695,14 @@ class EpsToTxtMainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.file_progress_bar.setValue(0)
+        self.progress_label.setText(f"0 из {len(zip_files)}")
+        self.file_progress_label.setText("0 из 0")
         self.log_text.clear()
+        
+        # Сохраняем общее количество архивов для отображения
+        self.total_archives = len(zip_files)
+        self.current_archive = 0
         
         # Добавляем информацию в лог
         self.add_log(f"🚀 Начинаем обработку {len(zip_files)} архивов")
@@ -581,6 +717,8 @@ class EpsToTxtMainWindow(QMainWindow):
         )
         
         self.processing_thread.progress_updated.connect(self.update_progress)
+        self.processing_thread.file_progress_updated.connect(self.update_file_progress)
+        self.processing_thread.archive_started.connect(self.archive_started)
         self.processing_thread.archive_completed.connect(self.archive_completed)
         self.processing_thread.processing_finished.connect(self.processing_finished)
         self.processing_thread.error_occurred.connect(self.processing_error)
@@ -600,6 +738,10 @@ class EpsToTxtMainWindow(QMainWindow):
             self.status_label.setText("Обработка остановлена")
             self.statusBar().showMessage("Обработка остановлена")
             
+            # Сбрасываем прогресс-бары
+            self.progress_label.setText("Остановлено")
+            self.file_progress_label.setText("Остановлено")
+            
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
     
@@ -610,9 +752,28 @@ class EpsToTxtMainWindow(QMainWindow):
         QMessageBox.information(self, "Информация", "Кэш успешно очищен!")
     
     def update_progress(self, value):
-        """Обновление прогресса"""
+        """Обновление прогресса архивов"""
         self.progress_bar.setValue(value)
-        self.progress_label.setText(f"{value}%")
+        # Вычисляем текущий архив из процентов
+        current = int(value * self.total_archives / 100)
+        self.progress_label.setText(f"{current} из {self.total_archives}")
+    
+    def update_file_progress(self, current, total, archive_index):
+        """Обновление прогресса файлов в текущем архиве"""
+        if total > 0:
+            percentage = int(current * 100 / total)
+            self.file_progress_bar.setValue(percentage)
+        else:
+            self.file_progress_bar.setValue(0)
+        
+        self.file_progress_label.setText(f"{current} из {total}")
+    
+    def archive_started(self, archive_name, file_count):
+        """Начало обработки нового архива"""
+        self.add_log(f"📦 Начинаем архив: {archive_name} ({file_count} файлов)")
+        self.file_progress_bar.setValue(0)
+        self.file_progress_label.setText(f"0 из {file_count}")
+        self.status_label.setText(f"Обрабатывается: {archive_name}")
     
     def archive_completed(self, archive_name, stats):
         """Завершение обработки архива"""
@@ -624,6 +785,12 @@ class EpsToTxtMainWindow(QMainWindow):
         """Завершение всей обработки"""
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        
+        # Завершаем прогресс-бары
+        self.progress_bar.setValue(100)
+        self.file_progress_bar.setValue(100)
+        self.progress_label.setText(f"{total_stats['archives_processed']} из {self.total_archives}")
+        self.file_progress_label.setText("Завершено")
         
         # Обновляем статистику
         self.update_stats_table(total_stats)
@@ -646,7 +813,8 @@ class EpsToTxtMainWindow(QMainWindow):
         # Показываем уведомление
         QMessageBox.information(self, "Готово!", 
                                f"Обработка завершена!\n\n"
-                               f"Обработано: {total_stats['total_files']} файлов\n"
+                               f"Архивов: {total_stats['archives_processed']}\n"
+                               f"Файлов: {total_stats['total_files']}\n"
                                f"Успешно: {total_stats['total_successful']}\n"
                                f"Время: {total_stats['total_processing_time']:.1f} сек")
     
